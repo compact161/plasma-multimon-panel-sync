@@ -1,0 +1,1300 @@
+#!/usr/bin/env python3
+"""plasma-panel-sync — make Plasma panels identical on all screens.
+
+Panels are grouped by position (top, bottom, left, right). Each screen has at
+most one panel per position; within a position one panel is the source and the
+panels at the same position on the other screens become copies of it. Panel
+visibility (always visible, dodge windows, ...) stays per screen. Positions
+missing on a screen are not created there.
+
+Finding the source: after each sync a fingerprint of the panel layout is
+stored per position. On the next run, the panel that differs from it is the
+changed one = the source for its position. If several panels in one position
+differ, the tool stops and asks for --from.
+
+  plasma-panel-sync              # detect and sync automatically
+  plasma-panel-sync --from DP-1  # explicit source (output name, screen number or "main"),
+                                 # applies to all positions of that screen
+  plasma-panel-sync --dry-run    # show only, change nothing
+  plasma-panel-sync status       # screens, panels, differences
+  plasma-panel-sync restore      # restore the latest backup
+  plasma-panel-sync shortcuts    # remove orphaned widget shortcuts (also runs on every sync)
+  plasma-panel-sync config --main-bottom dodge  # fixed visibility for the main screen's
+                                 # bottom panel (always|autohide|dodge|below|keep)
+  plasma-panel-sync profile save "Work"     # save the layout (all positions)
+  plasma-panel-sync profile restore "Work"  # apply it to all screens
+  plasma-panel-sync profile list | delete <name>
+  plasma-panel-ui                # graphical UI
+"""
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# Plasma: location 3 = top, 4 = bottom (default), 5 = left, 6 = right
+LOCATIONS = {3: "top", 4: "bottom", 5: "left", 6: "right"}
+DEFAULT_LOCATION = 4
+
+# Keys that are not layout changes (popup sizes, caches,
+# last opened tab of a popup such as the volume applet, ...)
+IGNORED_KEYS = {
+    "popupHeight",
+    "popupWidth",
+    "DialogHeight",
+    "DialogWidth",
+    "cacheJson",
+    "lastScreen",
+    "immutability",
+    "currentTab",
+}
+IGNORED_GROUPS = {"ConfigDialog"}
+# Visibility belongs to each panel and is not copied (e.g. main bottom panel: dodge windows, others: always visible)
+PER_PANEL_KEYS = {"panelVisibility"}
+
+# panelVisibility values; names for the CLI and Plasma scripting ("hiding")
+VISIBILITY = {"always": 0, "autohide": 1, "dodge": 2, "below": 3}
+HIDING = {0: "none", 1: "autohide", 2: "dodgewindows", 3: "windowsgobelow"}
+
+CFG = Path.home() / ".config"
+APPLETSRC = CFG / "plasma-org.kde.plasma.desktop-appletsrc"
+SHELLRC = CFG / "plasmashellrc"
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "plasma-panel-sync"
+SNAPSHOT = STATE / "snapshot.json"
+LOG = STATE / "sync.log"
+SERVICE = "plasma-plasmashell.service"
+SETTINGS = CFG / "plasma-panel-sync.json"  # {"mainBottomVisibility": 0-3 | null}
+PROFILES = (
+    Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+    / "plasma-panel-sync/profiles"
+)
+PROFILE_ID = (
+    "PROFILE"  # placeholder containment while loading a profile (per position: PROFILE-<loc>)
+)
+
+
+# --- KConfig file (order and untouched groups are preserved) ----------------
+class KConfig:
+    def __init__(self, path):
+        self.path = path
+        self.groups = []  # [tuple | None, [lines]]
+        cur = [None, []]
+        self.groups.append(cur)
+        for line in path.read_text().splitlines():
+            if line.startswith("[") and line.rstrip().endswith("]"):
+                cur = [tuple(line.strip()[1:-1].split("][")), []]
+                self.groups.append(cur)
+            else:
+                cur[1].append(line)
+
+    def find(self, key):
+        return next((g for g in self.groups if g[0] == key), None)
+
+    @staticmethod
+    def kv(lines):
+        out = {}
+        for l in lines:  # noqa: E741
+            if "=" in l and not l.startswith("#"):
+                k, v = l.split("=", 1)
+                out[k] = v
+        return out
+
+    @staticmethod
+    def set_key(lines, key, value):
+        for i, l in enumerate(lines):  # noqa: E741
+            if l.split("=", 1)[0] == key:
+                lines[i] = f"{key}={value}"
+                return
+        while lines and lines[-1] == "":
+            lines.pop()
+        lines.append(f"{key}={value}")
+        lines.append("")
+
+    def write(self):
+        out = []
+        for name, lines in self.groups:
+            if name is not None:
+                out.append("[" + "][".join(name) + "]")
+            body = list(lines)
+            if name is not None and (not body or body[-1] != ""):
+                body.append("")
+            out.extend(body)
+        text = "\n".join(out).rstrip("\n") + "\n"
+        tmp = self.path.with_suffix(".pps-tmp")
+        tmp.write_text(text)
+        os.replace(tmp, self.path)
+
+
+# --- Screens -----------------------------------------------------------------
+def outputs():
+    """Active outputs, sorted by priority (= Plasma screen index)."""
+    try:
+        env = {k: v for k, v in os.environ.items() if k != "QT_QPA_PLATFORM"}
+        data = json.loads(
+            subprocess.run(
+                ["kscreen-doctor", "-j"],
+                capture_output=True,
+                env=env,
+                text=True,
+                check=True,
+                timeout=10,
+            ).stdout
+        )
+        # Plasma >= 6.8 no longer reports "enabled"; disabled outputs have priority 0 there.
+        return sorted(
+            (
+                o
+                for o in data["outputs"]
+                if o.get("enabled", o.get("connected", True) and o.get("priority", 1) > 0)
+            ),
+            key=lambda o: o.get("priority", 99),
+        )
+    except Exception:
+        return []
+
+
+def screens():
+    """Plasma screen index -> output name."""
+    return {i: o["name"] for i, o in enumerate(outputs())}
+
+
+def label(scr, names):
+    n = names.get(scr, "?")
+    return f"Screen {scr} ({n}{', main' if scr == 0 else ''})"
+
+
+def loc_name(loc):
+    return LOCATIONS.get(loc, f"Position {loc}")
+
+
+# --- Panels ------------------------------------------------------------------
+def panels(rc):
+    """Panel ID -> {"screen": int, "location": int}."""
+    res = {}
+    for name, lines in rc.groups:
+        if name and len(name) == 2 and name[0] == "Containments":
+            kv = KConfig.kv(lines)
+            if kv.get("plugin") == "org.kde.panel":
+                res[name[1]] = {
+                    "screen": int(kv.get("lastScreen", "-1")),
+                    "location": int(kv.get("location", DEFAULT_LOCATION) or DEFAULT_LOCATION),
+                }
+    return res
+
+
+def groups(pan):
+    """Position -> {screen -> panel ID}. Stops if a screen has several panels at
+    one position or a panel is not assigned to any screen."""
+    res = {}
+    for pid, info in pan.items():
+        scr, loc = info["screen"], info["location"]
+        if scr < 0:
+            raise SystemExit(f"Panel {pid} is not assigned to any screen — please check manually.")
+        if scr in res.setdefault(loc, {}):
+            raise SystemExit(
+                f"Screen {scr} has several {loc_name(loc)} panels "
+                f"({res[loc][scr]}, {pid}) — please check manually."
+            )
+        res[loc][scr] = pid
+    return dict(sorted(res.items()))
+
+
+def subtree(rc, pid):
+    return [g for g in rc.groups if g[0] and len(g[0]) > 2 and g[0][:2] == ("Containments", pid)]
+
+
+def view_groups(shell, pid):
+    return [
+        g
+        for g in shell.groups
+        if g[0] and len(g[0]) >= 2 and g[0][0] == "PlasmaViews" and g[0][1] == f"Panel {pid}"
+    ]
+
+
+def load_settings():
+    try:
+        s = json.loads(SETTINGS.read_text())
+    except (OSError, ValueError):
+        s = {}
+    v = s.get("mainBottomVisibility")
+    return {"mainBottomVisibility": v if v in HIDING else None}
+
+
+def main_bottom_panel(pan):
+    """ID of the bottom panel on the main screen (screen 0), or None."""
+    return next((p for p, i in pan.items() if i["screen"] == 0 and i["location"] == 4), None)
+
+
+def enforce_main_bottom(shell, pan):
+    """Set the configured visibility on the main bottom panel (Plasma stopped).
+    Returns the panel ID if a value was set, else None."""
+    vis = load_settings()["mainBottomVisibility"]
+    pid = main_bottom_panel(pan)
+    if vis is None or pid is None:
+        return None
+    g = shell.find(("PlasmaViews", f"Panel {pid}"))
+    if g is None:
+        g = [("PlasmaViews", f"Panel {pid}"), []]
+        shell.groups.append(g)
+    KConfig.set_key(g[1], "panelVisibility", str(vis))
+    return pid
+
+
+def applet_ids(groups_):
+    ids = set()
+    for name, _ in groups_:
+        for i in range(3, len(name)):
+            if name[i - 1] == "Applets" and name[i].isdigit():
+                ids.add(name[i])
+    return sorted(ids, key=int)
+
+
+def nested_ids(groups_):
+    """IDs of container applets (system tray) and their child applets."""
+    res = set()
+    for name, _ in groups_:
+        ids = [
+            name[i] for i in range(3, len(name)) if name[i - 1] == "Applets" and name[i].isdigit()
+        ]
+        if len(ids) > 1:
+            res.update(ids)
+    return res
+
+
+def remap_tuple(name, m):
+    return tuple(
+        m.get(p, p) if i > 0 and name[i - 1] == "Applets" else p for i, p in enumerate(name)
+    )
+
+
+def remap_lines(lines, m):
+    out = []
+    for l in lines:  # noqa: E741
+        if l.startswith("AppletOrder="):
+            l = "AppletOrder=" + ";".join(m.get(x, x) for x in l.split("=", 1)[1].split(";"))  # noqa: E741, PLW2901
+        out.append(l)
+    return out
+
+
+def fingerprint(rc, shell, pid):
+    """Normalized layout of a panel, independent of IDs and screen.
+    Visibility (panelVisibility) is per panel and left out (PER_PANEL_KEYS)."""
+    sub = subtree(rc, pid)
+    # Number by plugin, not only by ID: Plasma adds tray entries later
+    # (e.g. dwellclicker) with new IDs that would sort differently per panel.
+    plug = {n[-1]: KConfig.kv(l).get("plugin", "") for n, l in sub if n[-2] == "Applets"}  # noqa: E741
+    nested = nested_ids(sub)
+    ids = sorted(applet_ids(sub), key=lambda i: (i in nested, plug.get(i, ""), int(i)))
+    m = {old: f"#{i}" for i, old in enumerate(ids)}
+    root = rc.find(("Containments", pid))
+    groups_ = [(("root",), root[1])] + [(remap_tuple(n, m)[2:], l) for n, l in sub]  # noqa: E741
+    norm = {}
+    for name, lines in groups_:
+        if any(p in IGNORED_GROUPS for p in name):
+            continue
+        kv = {k: v for k, v in KConfig.kv(remap_lines(lines, m)).items() if k not in IGNORED_KEYS}
+        if kv:
+            norm["/".join(name)] = kv
+    for name, lines in view_groups(shell, pid):
+        kv = {k: v for k, v in KConfig.kv(lines).items() if k not in PER_PANEL_KEYS}
+        if kv:
+            norm["view/" + "/".join(name[2:])] = kv
+    return layout_hash(norm), norm
+
+
+def layout_hash(norm):
+    blob = json.dumps(norm, sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def snapshot_hash(entry):
+    """Recompute a snapshot entry's hash with the current ignore rules, so newly
+    ignored keys do not make older snapshots look changed."""
+    layout = entry.get("layout")
+    if not isinstance(layout, dict):
+        return entry.get("hash")
+    norm = {}
+    for name, kv in layout.items():
+        if not name.startswith("view/"):
+            kv = {k: v for k, v in kv.items() if k not in IGNORED_KEYS}  # noqa: PLW2901
+        kv = {k: v for k, v in kv.items() if k not in PER_PANEL_KEYS}  # noqa: PLW2901
+        if kv:
+            norm[name] = kv
+    return layout_hash(norm)
+
+
+# --- Cloning -----------------------------------------------------------------
+def next_id(rc, shell):
+    nums = [int(p) for name, _ in rc.groups if name for p in name if p.isdigit()]
+    nums += [
+        int(m.group(1))
+        for name, _ in shell.groups
+        if name and len(name) > 1
+        for m in [re.match(r"Panel (\d+)$", name[1])]
+        if m
+    ]
+    return max(nums, default=0) + 1
+
+
+def duplicate_ids(rc):
+    """Applet ID -> distinct applet paths, for IDs that are used more than once."""
+    occ = {}
+    for name, _ in rc.groups:
+        if name and name[0] == "Containments":
+            for i in range(3, len(name)):
+                if name[i - 1] == "Applets" and name[i].isdigit():
+                    occ.setdefault(name[i], set()).add(name[: i + 1])
+    return {k: sorted(v, key=len) for k, v in occ.items() if len(v) > 1}
+
+
+def repair_duplicate_ids(rc, shell):
+    """Resolve duplicate applet IDs: the shallowest occurrence (referenced in AppletOrder)
+    keeps the ID, nested ones (tray entries) get a new one. Returns the count."""
+    fixed = 0
+    for _, paths in duplicate_ids(rc).items():
+        for path in paths[1:]:
+            new = str(next_id(rc, shell))
+            n = len(path)
+            rc.groups = [
+                [g[0][: n - 1] + (new,) + g[0][n:] if g[0] and g[0][:n] == path else g[0], g[1]]
+                for g in rc.groups
+            ]
+            fixed += 1
+    return fixed
+
+
+def clone(rc, shell, src, dst, dst_screen):
+    """Copy panel src completely (widgets, settings, view) onto the existing
+    panel dst; dst stays on dst_screen and keeps its own visibility."""
+    nid = next_id(rc, shell)
+    m = {}
+    # Number container applets (system tray) and their children last: Plasma loads
+    # by ID and gives tray entries it adds later "highest loaded ID + 1" — if a
+    # panel widget came after that, a duplicate ID would result.
+    sub = subtree(rc, src)
+    nested = nested_ids(sub)
+    for old in sorted(applet_ids(sub), key=lambda i: (i in nested, int(i))):
+        m[old] = str(nid)
+        nid += 1
+
+    def to_dst(name):
+        return ("Containments", dst) + remap_tuple(name, m)[2:]
+
+    new_sub = [[to_dst(n), remap_lines(l, m)] for n, l in subtree(rc, src)]  # noqa: E741
+    root_lines = list(rc.find(("Containments", src))[1])
+    KConfig.set_key(root_lines, "lastScreen", str(dst_screen))
+
+    old_sub = {id(g) for g in subtree(rc, dst)}
+    groups_ = []
+    for g in rc.groups:
+        if id(g) in old_sub:
+            continue
+        if g[0] == ("Containments", dst):
+            groups_.append([g[0], root_lines])
+            groups_.extend(new_sub)
+        else:
+            groups_.append(g)
+    rc.groups = groups_
+
+    # Panel view (height, alignment, floating, visibility, ...) from plasmashellrc
+    src_views = view_groups(shell, src)
+    dst_views = view_groups(shell, dst)
+    dst_main = shell.find(("PlasmaViews", f"Panel {dst}"))
+    own = {
+        k: v for k, v in KConfig.kv(dst_main[1] if dst_main else []).items() if k in PER_PANEL_KEYS
+    }
+    old_views = {id(g) for g in dst_views}
+    groups_, inserted = [], False
+    for g in shell.groups:
+        if id(g) in old_views:
+            continue
+        groups_.append(g)
+        if g in src_views and g is src_views[-1] and not inserted:
+            for n, l in src_views:  # noqa: E741
+                lines = [x for x in l if x.split("=", 1)[0] not in PER_PANEL_KEYS]
+                if len(n) == 2:  # main group only, not [Defaults]/[Horizontal…]
+                    for k, v in own.items():
+                        KConfig.set_key(lines, k, v)
+                groups_.append([(n[0], f"Panel {dst}") + n[2:], lines])
+            inserted = True
+    shell.groups = groups_
+
+
+# --- Helpers -----------------------------------------------------------------
+def notify(msg, error=False):
+    print(msg, file=sys.stderr if error else sys.stdout)
+    # Never block: Plasma itself is the notification service and is stopped
+    # during the sync. The UI shows the result itself (PPS_NO_NOTIFY).
+    if (
+        not sys.stdout.isatty()
+        and not os.environ.get("PPS_NO_NOTIFY")
+        and shutil.which("notify-send")
+    ):
+        subprocess.Popen(
+            [
+                "notify-send",
+                "-a",
+                "Panel-Sync",
+                "-i",
+                "dialog-error" if error else "view-refresh",
+                "Panel-Sync",
+                msg,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+
+def log(msg):
+    STATE.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as f:
+        f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+
+
+def save_snapshot(rc, shell, grp, source):
+    """Store the fingerprint of one panel per position (any, since they are equal)."""
+    data = {
+        "version": 2,
+        "source": source,
+        "time": dt.datetime.now().isoformat(timespec="seconds"),
+        "groups": {},
+    }
+    for loc, by_screen in grp.items():
+        pid = by_screen[min(by_screen)]
+        fp, norm = fingerprint(rc, shell, pid)
+        data["groups"][str(loc)] = {"hash": fp, "layout": norm}
+    STATE.mkdir(parents=True, exist_ok=True)
+    SNAPSHOT.write_text(json.dumps(data, indent=1, sort_keys=True))
+
+
+def load_snapshot():
+    try:
+        snap = json.loads(SNAPSHOT.read_text())
+        return snap if snap.get("version") == 2 and isinstance(snap.get("groups"), dict) else None
+    except Exception:
+        return None
+
+
+def diff(old, new):
+    lines = []
+    for g in sorted(set(old) | set(new)):
+        a, b = old.get(g, {}), new.get(g, {})
+        for k in sorted(set(a) | set(b)):
+            if k in IGNORED_KEYS and not g.startswith("view/"):
+                continue
+            if a.get(k) != b.get(k):
+                lines.append(f"    {g}: {k}: {a.get(k, '∅')[:60]} → {b.get(k, '∅')[:60]}")
+    return lines
+
+
+STOP_GRACE = 8  # s; plasmashell often hangs on exit until the systemd timeout (40 s)
+
+
+def plasmashell(action):
+    if action != "stop":
+        subprocess.run(["systemctl", "--user", action, SERVICE], check=True, timeout=60)
+        return
+    # Stop normally (Plasma writes pending config on exit); if it hangs, kill it
+    # after STOP_GRACE so the panels are not gone for long.
+    subprocess.run(["systemctl", "--user", "stop", "--no-block", SERVICE], check=True, timeout=10)
+    deadline = time.monotonic() + STOP_GRACE
+    killed = False
+    while subprocess.run(  # noqa: PLW1510
+        ["systemctl", "--user", "is-active", SERVICE], capture_output=True, text=True
+    ).stdout.strip() in ("active", "deactivating", "reloading"):
+        if not killed and time.monotonic() > deadline:
+            subprocess.run(["systemctl", "--user", "kill", "--signal=SIGKILL", SERVICE], timeout=10)  # noqa: PLW1510
+            killed = True
+        if time.monotonic() > deadline + 20:
+            raise SystemExit("plasmashell cannot be stopped.")
+        time.sleep(0.2)
+
+
+# --- Global shortcuts --------------------------------------------------------
+# Every sync gives the cloned widgets new IDs. Otherwise KGlobalAccel keeps the
+# entries "activate widget <old ID>" forever (System Settings → Shortcuts →
+# plasmashell). kglobalshortcutsrc belongs to the running service, so
+# unregister via D-Bus instead of editing the file.
+WIDGET_SHORTCUT = re.compile(r"activate widget (\d+)$")
+
+
+def shortcut_names():
+    out = subprocess.run(
+        [
+            "busctl",
+            "--user",
+            "--json=short",
+            "call",
+            "org.kde.kglobalaccel",
+            "/component/plasmashell",
+            "org.kde.kglobalaccel.Component",
+            "shortcutNames",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    ).stdout
+    return json.loads(out)["data"][0]
+
+
+def unregister_shortcut(name):
+    subprocess.run(
+        [
+            "busctl",
+            "--user",
+            "call",
+            "org.kde.kglobalaccel",
+            "/kglobalaccel",
+            "org.kde.KGlobalAccel",
+            "unregister",
+            "ss",
+            "plasmashell",
+            name,
+        ],
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
+
+
+def prune_shortcuts(rc):
+    """Remove shortcuts of widgets that no longer exist in rc. Never fatal."""
+    try:
+        alive = set(applet_ids(g for g in rc.groups if g[0]))
+        gone = [
+            n
+            for n in shortcut_names()
+            for m in [WIDGET_SHORTCUT.match(n)]
+            if m and m.group(1) not in alive
+        ]
+        for n in gone:
+            unregister_shortcut(n)
+    except Exception as e:
+        log(f"Shortcuts not cleaned up: {e}")
+        return 0
+    if gone:
+        log(f"Removed {len(gone)} orphaned widget shortcuts")
+    return len(gone)
+
+
+def resolve_from(arg, names):
+    """Screen argument (main, number, output name) -> screen index."""
+    if arg == "main":
+        return 0
+    if arg.isdigit():
+        return int(arg)
+    scr = next((s for s, n in names.items() if n.lower() == arg.lower()), None)
+    if scr is None:
+        sys.exit(f"Unknown screen '{arg}'. Screens: {names}")
+    return scr
+
+
+# --- Detection ---------------------------------------------------------------
+class Analysis:
+    """Result of analyze(): state of all positions compared to the snapshot."""
+
+    def __init__(self):
+        self.snapshot = None
+        self.nosnap = False  # no snapshot and panels differ
+        self.groups = {}  # loc -> {"equal": bool, "changed": [pid], "source": pid|None,
+        #         "hashes": {pid: hash}}
+        self.changed = []  # all changed panel IDs
+        self.ambiguous = []  # positions with several changed panels
+        self.refresh = []  # positions changed the same way everywhere
+        self.auto_source = None  # screen index if all changes are on one screen
+
+    @property
+    def all_equal(self):
+        return all(g["equal"] for g in self.groups.values())
+
+    @property
+    def needs_sync(self):
+        return bool(self.changed) or self.nosnap
+
+
+def analyze(rc, shell, pan):
+    a = Analysis()
+    grp = groups(pan)
+    a.snapshot = load_snapshot()
+    snap_groups = a.snapshot["groups"] if a.snapshot else {}
+    src_screens = set()
+    for loc, by_screen in grp.items():
+        hashes = {pid: fingerprint(rc, shell, pid)[0] for pid in by_screen.values()}
+        equal = len(set(hashes.values())) == 1
+        entry = snap_groups.get(str(loc))
+        ref = snapshot_hash(entry) if entry else None
+        changed = [pid for pid, h in hashes.items() if ref is not None and h != ref]
+        g = {"equal": equal, "changed": changed, "source": None, "hashes": hashes, "ref": ref}
+        if ref is None:
+            if not equal:
+                a.nosnap = True
+        elif equal and changed:
+            a.refresh.append(loc)  # same change everywhere — already in sync
+            g["changed"] = []
+        elif len(changed) == 1:
+            g["source"] = changed[0]
+            src_screens.add(pan[changed[0]]["screen"])
+        elif len(changed) > 1:
+            a.ambiguous.append(loc)
+        a.changed += g["changed"]
+        a.groups[loc] = g
+    if a.changed and not a.ambiguous and len(src_screens) == 1:
+        a.auto_source = src_screens.pop()
+    return a
+
+
+# --- Profiles (explicitly saved panel layouts) -------------------------------
+def panel_widgets(rc, pid):
+    sub = [(n, l) for n, l in subtree(rc, pid) if len(n) == 4]  # noqa: E741
+    plug = {n[3]: KConfig.kv(l).get("plugin", "?") for n, l in sub}  # noqa: E741
+    order = KConfig.kv((rc.find(("Containments", pid, "General")) or [None, []])[1]).get(
+        "AppletOrder", ""
+    )
+    ws = [plug[x] for x in order.split(";") if x in plug] or list(plug.values())
+    return [w.split(".")[-1] for w in ws]
+
+
+def slugify(name):
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", name.strip()).strip("-").lower()
+    return slug or "profil"
+
+
+def profile_dir(name):
+    d = PROFILES / slugify(name)
+    if not d.is_dir():
+        # also find it by display name
+        for m in PROFILES.glob("*/meta.json"):
+            if json.loads(m.read_text()).get("name") == name:
+                return m.parent
+    return d
+
+
+def write_groups(path, groups_):
+    k = KConfig.__new__(KConfig)
+    k.path, k.groups = path, [[None, []]] + [[n, list(l)] for n, l in groups_]  # noqa: E741
+    k.write()
+
+
+def profile_pid(loc):
+    return f"{PROFILE_ID}-{loc}"
+
+
+def inject_profile(rc, shell, d, locs):
+    """Insert the profile into the loaded configs as placeholder panels PROFILE-<loc>."""
+    for loc in locs:
+        rc.groups += [[n, l] for n, l in KConfig(d / f"panel-{loc}.rc").groups if n]  # noqa: E741
+        shell.groups += [[n, l] for n, l in KConfig(d / f"view-{loc}.rc").groups if n]  # noqa: E741
+
+
+def eject_profile(rc, shell):
+    rc.groups = [
+        g
+        for g in rc.groups
+        if not (g[0] and g[0][0] == "Containments" and g[0][1].startswith(PROFILE_ID))
+    ]
+    shell.groups = [
+        g
+        for g in shell.groups
+        if not (g[0] and g[0][0] == "PlasmaViews" and g[0][1].startswith(f"Panel {PROFILE_ID}"))
+    ]
+
+
+def list_profiles():
+    try:
+        rc, shell = KConfig(APPLETSRC), KConfig(SHELLRC)
+        grp = groups(panels(rc))
+        current = {
+            str(loc): {fingerprint(rc, shell, p)[0] for p in by.values()} for loc, by in grp.items()
+        }
+        current = {
+            loc: hs.pop() for loc, hs in current.items() if len(hs) == 1
+        }  # equal positions only
+    except Exception:
+        current = {}
+    res = []
+    for m in sorted(PROFILES.glob("*/meta.json")):
+        try:
+            meta = json.loads(m.read_text())
+        except Exception:  # noqa: S112
+            continue
+        meta["id"] = m.parent.name
+        hashes = meta.get("hashes", {})
+        meta["active"] = bool(hashes) and all(current.get(loc) == h for loc, h in hashes.items())
+        res.append(meta)
+    return sorted(res, key=lambda x: x.get("created", ""), reverse=True)
+
+
+def cmd_profile(args):
+    action = args.rest[0] if args.rest else "list"
+    name = " ".join(args.rest[1:]).strip()
+    names = screens()
+
+    if action == "list":
+        for p in list_profiles():
+            w = "; ".join(
+                f"{loc_name(int(loc))}: {', '.join(ws)}" for loc, ws in p.get("widgets", {}).items()
+            )
+            print(
+                f"{'*' if p['active'] else ' '} {p['name']:<24} {p['created']}  ({p.get('source', '?')}) {w}"
+            )
+        return
+
+    if not name:
+        raise SystemExit(f"Name missing: plasma-panel-sync profile {action} <name>")
+
+    if action == "save":
+        rc, shell = KConfig(APPLETSRC), KConfig(SHELLRC)
+        pan = panels(rc)
+        grp = groups(pan)
+        if args.source:
+            scr = resolve_from(args.source, names)
+        else:
+            a = analyze(rc, shell, pan)
+            if a.changed or a.nosnap:
+                if a.auto_source is None:
+                    raise SystemExit(
+                        "Panels are not in sync — use --from <screen> to choose which one to save."
+                    )
+                scr = a.auto_source
+            else:
+                scr = 0
+        locs = {loc: by[scr] for loc, by in grp.items() if scr in by}
+        if not locs:
+            raise SystemExit(f"{label(scr, names)} has no panel.")
+        d = PROFILES / slugify(name)
+        if d.exists() and not args.force:
+            raise SystemExit(f"Profile '{name}' already exists (use --force to overwrite).")
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "name": name,
+            "created": dt.datetime.now().isoformat(timespec="seconds"),
+            "source": names.get(scr, str(scr)),
+            "locations": sorted(locs),
+            "hashes": {},
+            "widgets": {},
+        }
+        for loc, src in locs.items():
+            ppid = profile_pid(loc)
+            root = rc.find(("Containments", src))
+            groups_ = [(("Containments", ppid), root[1])] + [
+                (("Containments", ppid) + n[2:], l)
+                for n, l in subtree(rc, src)  # noqa: E741
+            ]
+            write_groups(d / f"panel-{loc}.rc", groups_)
+            write_groups(
+                d / f"view-{loc}.rc",
+                [(("PlasmaViews", f"Panel {ppid}") + n[2:], l) for n, l in view_groups(shell, src)],  # noqa: E741
+            )
+            meta["hashes"][str(loc)] = fingerprint(rc, shell, src)[0]
+            meta["widgets"][str(loc)] = panel_widgets(rc, src)
+        (d / "meta.json").write_text(json.dumps(meta, indent=1, ensure_ascii=False) + "\n")
+        log(
+            f"Profile '{name}' saved (from {meta['source']}: "
+            + ", ".join(loc_name(l) for l in sorted(locs))  # noqa: E741
+            + ")"
+        )
+        notify(f"Profile '{name}' saved.")
+
+    elif action == "delete":
+        d = profile_dir(name)
+        if not (d / "meta.json").exists():
+            raise SystemExit(f"Profile '{name}' not found.")
+        shutil.rmtree(d)
+        log(f"Profile '{name}' deleted")
+        print(f"Profile '{name}' deleted.")
+
+    elif action == "restore":
+        d = profile_dir(name)
+        if not (d / "meta.json").exists():
+            raise SystemExit(f"Profile '{name}' not found.")
+        meta = json.loads((d / "meta.json").read_text())
+        locs = [int(l) for l in meta.get("locations", [])]  # noqa: E741
+        if not locs:
+            raise SystemExit(
+                f"Profile '{name}' uses an old format without positions — please save it again."
+            )
+        plasmashell("stop")
+        try:
+            rc, shell = KConfig(APPLETSRC), KConfig(SHELLRC)
+            pan = panels(rc)
+            grp = groups(pan)
+            backup()
+            inject_profile(rc, shell, d, locs)
+            skipped = []
+            for loc in locs:
+                if loc not in grp:
+                    skipped.append(loc_name(loc))
+                    continue
+                for scr, pid in grp[loc].items():
+                    clone(rc, shell, profile_pid(loc), pid, scr)
+            eject_profile(rc, shell)
+            enforce_main_bottom(shell, panels(rc))
+            rc.write()
+            shell.write()
+            prune_shortcuts(rc)
+            save_snapshot(rc, shell, groups(panels(rc)), f"profile {meta['name']}")
+            msg = f"Profile '{meta['name']}' restored → all screens"
+            if skipped:
+                msg += f" (no {', '.join(skipped)} panel — skipped)"
+            log(msg)
+            notify(f"Profile '{meta['name']}' restored.")
+        finally:
+            plasmashell("start")
+    else:
+        raise SystemExit(f"Unknown action '{action}' (list, save, restore, delete).")
+
+
+def backup():
+    bdir = STATE / "backups" / dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    bdir.mkdir(parents=True, exist_ok=True)
+    for f in (APPLETSRC, SHELLRC, SNAPSHOT):
+        if f.exists():
+            shutil.copy2(f, bdir / f.name)
+    for old in sorted((STATE / "backups").glob("*"))[:-10]:
+        shutil.rmtree(old)
+
+
+# --- Commands ----------------------------------------------------------------
+def cmd_status(_):
+    rc, shell, names = KConfig(APPLETSRC), KConfig(SHELLRC), screens()
+    pan = panels(rc)
+    grp = groups(pan)
+    a = analyze(rc, shell, pan)
+    print("Screens:", ", ".join(f"{s}={n}" for s, n in names.items()))
+    if a.snapshot:
+        print(f"Last sync: {a.snapshot['time']} from {a.snapshot['source']}")
+    for loc, by_screen in grp.items():
+        g = a.groups[loc]
+        print(f"Panels {loc_name(loc)}:" + ("" if g["ref"] else "  (no snapshot)"))
+        for scr, p in sorted(by_screen.items()):
+            fp, norm = fingerprint(rc, shell, p)
+            vis = KConfig.kv((shell.find(("PlasmaViews", f"Panel {p}")) or [None, []])[1]).get(
+                "panelVisibility"
+            )
+            state = "" if not g["ref"] else ("  = in sync" if fp == g["ref"] else "  ≠ CHANGED")
+            print(f"  Panel {p}: {label(scr, names)}  visibility={vis}  hash={fp}{state}")
+            if g["ref"] and fp != g["ref"]:
+                print("\n".join(diff(a.snapshot["groups"][str(loc)]["layout"], norm)))
+    dups = duplicate_ids(rc)
+    if dups:
+        print(
+            "WARNING: duplicate applet IDs "
+            + ", ".join(sorted(dups, key=int))
+            + " — they get new IDs on the next sync."
+        )
+    print("Note: Plasma writes changes with a delay — status can lag a few seconds behind.")
+
+
+def cmd_json(_):
+    """Full state as JSON (for the UI)."""
+    rc, shell, outs = KConfig(APPLETSRC), KConfig(SHELLRC), outputs()
+    pan = panels(rc)
+    grp = groups(pan)
+    a = analyze(rc, shell, pan)
+    res = []
+    for i, o in enumerate(outs):
+        sc = o.get("scale", 1) or 1
+        rot = o.get("rotation", 1) in (2, 8)
+        w, h = o["size"]["width"] / sc, o["size"]["height"] / sc
+        entry = {
+            "screen": i,
+            "name": o["name"],
+            "main": i == 0,
+            "x": o["pos"]["x"],
+            "y": o["pos"]["y"],
+            "width": h if rot else w,
+            "height": w if rot else h,
+            "panels": [],
+        }
+        for loc, by_screen in grp.items():
+            p = by_screen.get(i)
+            if not p:
+                continue
+            g = a.groups[loc]
+            fp, norm = fingerprint(rc, shell, p)
+            vis = KConfig.kv((shell.find(("PlasmaViews", f"Panel {p}")) or [None, []])[1]).get(
+                "panelVisibility", "0"
+            )
+            changed = p in g["changed"]
+            entry["panels"].append(
+                {
+                    "id": p,
+                    "location": loc,
+                    "locationName": loc_name(loc),
+                    "hash": fp,
+                    "visibility": int(vis),
+                    "inSync": g["equal"] and not g["changed"] and g["ref"] is not None,
+                    "changed": changed,
+                    "diff": diff(a.snapshot["groups"][str(loc)]["layout"], norm) if changed else [],
+                    "widgets": panel_widgets(rc, p),
+                }
+            )
+        res.append(entry)
+    try:
+        log_lines = LOG.read_text().splitlines()[-15:][::-1]
+    except Exception:
+        log_lines = []
+    print(
+        json.dumps(
+            {
+                "screens": res,
+                "locations": [
+                    {
+                        "location": loc,
+                        "name": loc_name(loc),
+                        "screens": sorted(by),
+                        "equal": a.groups[loc]["equal"],
+                        "changed": a.groups[loc]["changed"],
+                        "snapshot": a.groups[loc]["ref"] is not None,
+                    }
+                    for loc, by in grp.items()
+                ],
+                "snapshot": {k: a.snapshot[k] for k in ("source", "time")} if a.snapshot else None,
+                "autoSource": a.auto_source,
+                "changedCount": len(a.changed),
+                "ambiguous": [loc_name(l) for l in a.ambiguous],  # noqa: E741
+                "nosnap": a.nosnap,
+                "allEqual": a.all_equal,
+                "backups": len(list((STATE / "backups").glob("*")))
+                if (STATE / "backups").exists()
+                else 0,
+                "log": log_lines,
+                "profiles": list_profiles(),
+                "settings": load_settings(),
+            }
+        )
+    )
+
+
+def plasma_running():
+    return (
+        subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", SERVICE], check=False
+        ).returncode
+        == 0
+    )
+
+
+def set_hiding_live(pid, vis):
+    """Change a panel's visibility in the running plasmashell (no restart)."""
+    qdbus = shutil.which("qdbus6") or shutil.which("qdbus")
+    if not qdbus:
+        raise SystemExit("qdbus6 not found — cannot change the running panel.")
+    script = (
+        f"panels().forEach(function(p){{if(p.id=={int(pid)}){{p.hiding='{HIDING[vis]}';"
+        "print(p.hiding)}})"
+    )
+    out = subprocess.run(
+        [
+            qdbus,
+            "org.kde.plasmashell",
+            "/PlasmaShell",
+            "org.kde.PlasmaShell.evaluateScript",
+            script,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if out.returncode != 0 or out.stdout.strip() != HIDING[vis]:
+        raise SystemExit(
+            f"Plasma did not accept the visibility: {(out.stderr or out.stdout).strip()}"
+        )
+
+
+def cmd_config(args):
+    """Show or change the settings; a new value is applied right away."""
+    s = load_settings()
+    if args.main_bottom is not None:
+        v = args.main_bottom.lower()
+        if v == "keep":
+            s["mainBottomVisibility"] = None
+        elif v in VISIBILITY:
+            s["mainBottomVisibility"] = VISIBILITY[v]
+        elif v.isdigit() and int(v) in HIDING:
+            s["mainBottomVisibility"] = int(v)
+        else:
+            raise SystemExit(
+                f"Unknown visibility '{args.main_bottom}' ({'|'.join(VISIBILITY)}|keep)."
+            )
+        SETTINGS.write_text(json.dumps(s, indent=1) + "\n")
+        vis = s["mainBottomVisibility"]
+        if vis is not None:
+            shell = KConfig(SHELLRC)
+            pid = main_bottom_panel(panels(KConfig(APPLETSRC)))
+            if pid is None:
+                print("The main screen has no bottom panel — setting saved for later.")
+            elif plasma_running():
+                set_hiding_live(pid, vis)
+            else:
+                enforce_main_bottom(shell, panels(KConfig(APPLETSRC)))
+                shell.write()
+            if pid is not None:
+                log(f"main bottom panel {pid}: visibility {HIDING[vis]}")
+    vis = s["mainBottomVisibility"]
+    name = "keep" if vis is None else next(k for k, n in VISIBILITY.items() if n == vis)
+    print(f"main-bottom visibility: {name}")
+
+
+def cmd_check(_):
+    """Exit 0 = panels differ (sync needed), 1 = all in sync. For the watcher."""
+    rc, shell = KConfig(APPLETSRC), KConfig(SHELLRC)
+    a = analyze(rc, shell, panels(rc))
+    sys.exit(0 if a.needs_sync else 1)
+
+
+def cmd_shortcuts(_):
+    print(f"Removed {prune_shortcuts(KConfig(APPLETSRC))} orphaned widget shortcuts.")
+
+
+def cmd_restore(_):
+    backups = sorted((STATE / "backups").glob("*"))
+    if not backups:
+        sys.exit("No backup available.")
+    b = backups[-1]
+    plasmashell("stop")
+    try:
+        for f in b.iterdir():
+            if f.name != "snapshot.json":
+                shutil.copy2(f, CFG / f.name)
+        if (b / "snapshot.json").exists():
+            shutil.copy2(b / "snapshot.json", SNAPSHOT)
+        prune_shortcuts(KConfig(APPLETSRC))
+        shutil.rmtree(b)  # used up — the next restore goes one step further back
+    finally:
+        plasmashell("start")
+    log(f"restore {b.name}")
+    notify(f"Backup {b.name} restored.")
+
+
+def plan_sync(rc, shell, pan, names, source_arg):
+    """Returns (jobs, why, a); jobs = [(loc, src_pid, [target_pids])]."""
+    grp = groups(pan)
+    a = analyze(rc, shell, pan)
+    jobs = []
+    if source_arg:
+        scr = resolve_from(source_arg, names)
+        if not any(scr in by for by in grp.values()):
+            raise SystemExit(f"No panel on {label(scr, names)}. Screens: {names}")
+        for loc, by_screen in grp.items():
+            if scr not in by_screen:
+                print(f"{loc_name(loc)}: {label(scr, names)} has no panel there — skipped.")
+                continue
+            src = by_screen[scr]
+            targets = [p for s, p in sorted(by_screen.items()) if p != src]
+            if targets:
+                jobs.append((loc, src, targets))
+        return jobs, "via --from", a
+    if a.nosnap:
+        raise SystemExit(
+            "No snapshot yet and panels differ — run once with --from <screen> (e.g. --from main)."
+        )
+    if a.ambiguous:
+        raise SystemExit(
+            "Several panels were changed since the last sync ("
+            + ", ".join(loc_name(l) for l in a.ambiguous)  # noqa: E741
+            + ")\n→ use --from <screen> to choose which screen wins."
+        )
+    for loc, g in a.groups.items():
+        if g["source"]:
+            by_screen = grp[loc]
+            targets = [p for s, p in sorted(by_screen.items()) if p != g["source"]]
+            jobs.append((loc, g["source"], targets))
+            print(
+                f"Changes {loc_name(loc)}:\n"
+                + "\n".join(
+                    diff(
+                        a.snapshot["groups"][str(loc)]["layout"],
+                        fingerprint(rc, shell, g["source"])[1],
+                    )
+                )
+            )
+    return jobs, "auto-detected", a
+
+
+def cmd_sync(args):
+    names = screens()
+    if not args.dry_run:
+        plasmashell("stop")  # flushes pending changes and prevents overwriting
+    try:
+        rc, shell = KConfig(APPLETSRC), KConfig(SHELLRC)
+        pan = panels(rc)
+        fixed = repair_duplicate_ids(rc, shell)
+        if fixed:
+            print(f"Reassigned {fixed} duplicate applet ID(s).")
+        jobs, why, a = plan_sync(rc, shell, pan, names, args.source)  # noqa: RUF059
+        if not jobs:
+            if not args.dry_run:
+                if fixed:
+                    backup()
+                    rc.write()
+                    log(f"Reassigned {fixed} duplicate applet ID(s)")
+                save_snapshot(rc, shell, groups(pan), "all (equal)")
+                log("all panels equal — snapshot updated")
+            notify("All panels are already in sync.")
+            return
+        src_scr = pan[jobs[0][1]]["screen"]
+        for loc, src, targets in jobs:
+            print(f"{loc_name(loc)}: source panel {src} on {label(src_scr, names)} ({why})")
+            for p in targets:
+                print(f"  → panel {p} on {label(pan[p]['screen'], names)}")
+        if args.dry_run:
+            print("(dry run — nothing changed)")
+            return
+
+        backup()
+        if fixed:
+            log(f"Reassigned {fixed} duplicate applet ID(s)")
+        for loc, src, targets in jobs:  # noqa: B007
+            for p in targets:
+                clone(rc, shell, src, p, pan[p]["screen"])
+        enforce_main_bottom(shell, pan)
+        rc.write()
+        shell.write()
+        prune_shortcuts(rc)
+        save_snapshot(rc, shell, groups(pan), names.get(src_scr, str(src_scr)))
+        locs = ", ".join(loc_name(loc) for loc, _, _ in jobs)
+        target_screens = sorted({pan[p]["screen"] for _, _, ts in jobs for p in ts})
+        log(
+            f"sync {locs} from {label(src_scr, names)} ({why}) → "
+            + ", ".join(label(s, names) for s in target_screens)
+        )
+        notify(f"Panels ({locs}) from {names.get(src_scr, src_scr)} copied to all screens.")
+    finally:
+        if not args.dry_run:
+            plasmashell("start")
+
+
+# --- Detach from the caller --------------------------------------------------
+# plasmashell often takes 40 s to stop and is then killed with SIGKILL. The
+# Panel-Sync window goes away with it, and so does its child process (this
+# sync) — Plasma would stay stopped because "start" never runs. Commands that
+# stop Plasma therefore run in their own transient systemd unit; the caller
+# only waits and passes output and exit code through.
+DETACHED_UNIT = "plasma-panel-sync-run"
+
+
+def stops_plasma(args):
+    return (
+        args.command == "restore"
+        or (args.command == "sync" and not args.dry_run)
+        or (args.command == "profile" and args.rest[:1] == ["restore"])
+    )
+
+
+def run_detached():
+    if (
+        subprocess.run(  # noqa: PLW1510
+            ["systemctl", "--user", "is-active", "--quiet", DETACHED_UNIT + ".service"]
+        ).returncode
+        == 0
+    ):
+        sys.exit("A panel sync is already running — please wait a moment.")
+    env = ["-E", "PPS_DETACHED=1"] + (
+        ["-E", "PPS_NO_NOTIFY=1"] if os.environ.get("PPS_NO_NOTIFY") else []
+    )
+    return subprocess.run(  # noqa: PLW1510
+        [
+            "systemd-run",
+            "--user",
+            "--quiet",
+            "--collect",
+            "--pipe",
+            "--wait",
+            "--unit",
+            DETACHED_UNIT,
+            "--description",
+            "Panel-Sync",
+            *env,
+            sys.executable,
+            str(Path(__file__).resolve()),
+            *sys.argv[1:],
+        ]
+    ).returncode
+
+
+class _TolerantStream:
+    """Output stream that ignores a vanished reader (closed pipe)."""
+
+    def __init__(self, f):
+        self._f = f
+
+    def write(self, s):
+        try:
+            return self._f.write(s)
+        except OSError:
+            return len(s)
+
+    def flush(self):
+        try:  # noqa: SIM105
+            self._f.flush()
+        except OSError:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._f, name)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "command",
+        nargs="?",
+        default="sync",
+        choices=["sync", "status", "restore", "json", "profile", "check", "shortcuts", "config"],
+    )
+    ap.add_argument(
+        "rest", nargs="*", help="profile: list | save <name> | restore <name> | delete <name>"
+    )
+    ap.add_argument(
+        "-f", "--force", action="store_true", help="profile save: overwrite an existing profile"
+    )
+    ap.add_argument(
+        "--from", dest="source", help="source: main, screen number or output name (DP-1, ...)"
+    )
+    ap.add_argument(
+        "--main-bottom",
+        help="config: visibility of the main screen's bottom panel "
+        "(always, autohide, dodge, below, or keep = leave it alone)",
+    )
+    ap.add_argument("-n", "--dry-run", action="store_true")
+    args = ap.parse_args()
+    if os.environ.get("PPS_DETACHED"):
+        sys.stdout, sys.stderr = _TolerantStream(sys.stdout), _TolerantStream(sys.stderr)
+    elif stops_plasma(args) and shutil.which("systemd-run"):
+        sys.exit(run_detached())
+    try:
+        {
+            "sync": cmd_sync,
+            "status": cmd_status,
+            "restore": cmd_restore,
+            "json": cmd_json,
+            "profile": cmd_profile,
+            "check": cmd_check,
+            "shortcuts": cmd_shortcuts,
+            "config": cmd_config,
+        }[args.command](args)
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            notify(e.code, error=True)
+            sys.exit(1)
+        raise
+
+
+if __name__ == "__main__":
+    main()

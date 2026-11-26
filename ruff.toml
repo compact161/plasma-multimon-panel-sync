@@ -1,0 +1,18 @@
+# Shared default ruff config. Copy to the repo root (or merge into pyproject.toml [tool.ruff]).
+target-version = "py312"
+line-length = 100
+
+[lint]
+# E/F: pycodestyle + pyflakes, I: imports, B: bugbear, UP: pyupgrade, S: bandit (security),
+# SIM: simplify, PL: pylint subset, RUF: ruff-specific
+select = ["E", "F", "I", "B", "UP", "S", "SIM", "PLE", "PLW", "RUF"]
+ignore = [
+  "S603", "S607",  # subprocess with argument lists is how our tools work
+  "E501",          # long lines are handled by the formatter
+  "RUF001", "RUF002", "RUF003",  # typographic characters (– … „“) in text are intended
+  "RUF005",        # tuple/list concatenation vs unpacking is a style preference
+]
+
+[lint.per-file-ignores]
+"test*/**" = ["S101"]  # assert is fine in tests
+"test_*.py" = ["S101"]

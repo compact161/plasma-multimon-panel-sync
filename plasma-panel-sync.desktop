@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Panel-Sync
+Comment=Make Plasma panels identical on all screens
+Exec=@BIN@/plasma-panel-ui
+Icon=@ICON@
+Terminal=false
+Categories=Settings;DesktopSettings;

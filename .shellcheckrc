@@ -1,0 +1,2 @@
+# Shared default shellcheck config. Copy to the repo root.
+external-sources=true

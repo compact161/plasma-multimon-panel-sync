@@ -1,0 +1,39 @@
+# Shared pre-commit config (copied from the coding guidelines templates).
+# Copy to .pre-commit-config.yaml, delete the hooks for languages this repo does not use,
+# then: pre-commit install
+# All hooks are "local": they use the tools installed on the machine (no downloads).
+repos:
+  - repo: local
+    hooks:
+      - id: gitleaks
+        name: gitleaks (secrets)
+        entry: gitleaks git --pre-commit --staged --redact --no-banner .
+        language: system
+        pass_filenames: false
+      - id: ruff-format
+        name: ruff format
+        entry: ruff format
+        language: system
+        types_or: [python, pyi]
+      - id: ruff-check
+        name: ruff check
+        entry: ruff check --fix --exit-non-zero-on-fix
+        language: system
+        types_or: [python, pyi]
+      - id: shfmt
+        name: shfmt
+        entry: shfmt -i 4 -ci -w
+        language: system
+        types: [shell]
+        exclude_types: [zsh]
+      - id: shellcheck
+        name: shellcheck
+        entry: shellcheck
+        language: system
+        types: [shell]
+        exclude_types: [zsh]
+      - id: qmllint
+        name: qmllint (Qt 6)
+        entry: /usr/lib/qt6/bin/qmllint
+        language: system
+        files: \.qml$

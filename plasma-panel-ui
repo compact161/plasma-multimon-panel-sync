@@ -1,0 +1,17 @@
+#!/bin/sh
+# Window for plasma-panel-sync (Kirigami/QML, no extra packages needed).
+# If an instance is already running, only its window is brought to the front.
+# The system tray icon is a separate process: plasma-panel-tray
+DIR="$(dirname "$(readlink -f "$0")")"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/plasma-panel-sync"
+SHOW="$STATE/show-request"
+mkdir -p "$STATE"
+
+if pgrep -u "$(id -u)" -f "qml6 -a widget $DIR/ui/main.qml" >/dev/null; then
+    date +%s%N >"$SHOW" # running instance shows its window
+    exit 0
+fi
+
+export QT_QUICK_CONTROLS_STYLE="${QT_QUICK_CONTROLS_STYLE:-org.kde.desktop}"
+export QML_XHR_ALLOW_FILE_READ=1
+exec qml6 -a widget "$DIR/ui/main.qml" -- --show-file="$SHOW" "$@"

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Panel-Sync (system tray)
+Comment=Panel-Sync icon in the system tray
+Exec=@BIN@/plasma-panel-tray
+Icon=@ICON@
+Terminal=false
+X-KDE-autostart-phase=2

@@ -1,0 +1,13 @@
+# Shared default gitleaks config. Copy to the repo root as .gitleaks.toml.
+# Keep the default rules and add allowlists for known false positives only, each with a reason.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "known false positives"
+paths = [
+  '''(^|/)tests?/fixtures/.*\.html$''',   # saved web pages used as test input
+]
+regexes = [
+  '''SHA256:[A-Za-z0-9+/]{43}''',         # SSH key fingerprints
+]
